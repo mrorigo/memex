@@ -2,6 +2,7 @@ use crate::state::SessionScope;
 use crate::types::{Record, RecordLinks, SourceFilter};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::{File, OpenOptions};
@@ -57,6 +58,7 @@ pub struct IndexFields {
 pub struct SearchIndex {
     pub index: Index,
     pub fields: IndexFields,
+    snapshot_version: String,
     writable: bool,
     pending_generation: Option<Arc<PendingGeneration>>,
     _generation_lease: Option<Arc<GenerationLease>>,
@@ -377,6 +379,7 @@ impl SearchIndex {
             Ok(Self {
                 index,
                 fields,
+                snapshot_version: snapshot_version_for_path(dir),
                 writable: true,
                 pending_generation: None,
                 _generation_lease: None,
@@ -404,6 +407,12 @@ impl SearchIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?)
+    }
+
+    /// Open-time snapshot identity. It remains stable for this instance; writable callers must
+    /// reopen after committing if they need the newly committed identity.
+    pub fn snapshot_version(&self) -> &str {
+        &self.snapshot_version
     }
 
     pub(crate) fn maybe_compact_continuous_segments(&self, writer: &mut IndexWriter) -> Result<()> {
@@ -654,6 +663,27 @@ impl SearchIndex {
         .map(Some)
     }
 
+    /// Resolve up to two canonical-ID matches within one session scope. Current indexes use the
+    /// canonical-ID term directly. Legacy indexes must inspect stored records, but the fallback is
+    /// constrained to the supplied session/source/path scope and preserves session order.
+    pub fn records_by_canonical_id_in_session_scope(
+        &self,
+        record_id: &str,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+    ) -> Result<Vec<Record>> {
+        let reader = self.reader()?;
+        records_by_canonical_id_in_session_scope(
+            &reader.searcher(),
+            &self.fields,
+            record_id,
+            session_id,
+            source_path,
+            source,
+        )
+    }
+
     pub(crate) fn records_by_context_scope(
         &self,
         session_id: Option<&str>,
@@ -774,6 +804,59 @@ impl SearchIndex {
         Ok(records)
     }
 
+    /// Resolve up to two exact identities for a session with bounded document hydration.
+    /// Two records are sufficient for callers to reject ambiguous legacy deep links.
+    pub fn matching_session_scopes(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+    ) -> Result<Vec<(crate::types::SourceKind, String)>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let partial = session_query(&self.fields, session_id, source_path, source, None);
+        let representative = searcher.search(&partial, &TopDocs::with_limit(1))?;
+        let Some((_, representative_address)) = representative.first() else {
+            return Ok(Vec::new());
+        };
+        let representative_doc = searcher.doc::<TantivyDocument>(*representative_address)?;
+        let representative = record_from_doc(&self.fields, &representative_doc);
+        let mut matches = vec![(representative.source, representative.source_path.clone())];
+
+        let mut identity: Vec<(Occur, Box<dyn Query>)> = vec![(
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.source_path, &representative.source_path),
+                IndexRecordOption::Basic,
+            )),
+        )];
+        if let Some(source_query) = exact_source_query(&self.fields, representative.source) {
+            identity.push((Occur::Must, source_query));
+        }
+        let other_query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(session_query(
+                    &self.fields,
+                    session_id,
+                    source_path,
+                    source,
+                    None,
+                )),
+            ),
+            (Occur::MustNot, Box::new(BooleanQuery::new(identity))),
+        ]);
+        if let Some((_, other_address)) = searcher
+            .search(&other_query, &TopDocs::with_limit(1))?
+            .first()
+        {
+            let other_doc = searcher.doc::<TantivyDocument>(*other_address)?;
+            let other = record_from_doc(&self.fields, &other_doc);
+            matches.push((other.source, other.source_path));
+        }
+        Ok(matches)
+    }
+
     pub fn records_by_session_id_page(
         &self,
         session_id: &str,
@@ -781,6 +864,218 @@ impl SearchIndex {
         limit: usize,
     ) -> Result<(Vec<Record>, usize)> {
         self.records_by_session_path_page(session_id, None, offset, limit)
+    }
+
+    /// Find a canonical record in an exact session scope and return a page centered on it.
+    /// Current indexes hydrate only the matching anchor and returned page. Legacy indexes scan
+    /// stored records within the supplied scope to reconstruct canonical IDs before paging.
+    pub fn records_by_session_path_around(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+        record_id: &str,
+        limit: usize,
+    ) -> Result<Option<(Vec<Record>, usize, usize)>> {
+        self.records_by_session_scope_around(session_id, source_path, None, record_id, limit)
+    }
+
+    pub fn records_by_session_scope_around(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+        record_id: &str,
+        limit: usize,
+    ) -> Result<Option<(Vec<Record>, usize, usize)>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let anchors = records_by_canonical_id_in_session_scope(
+            &searcher,
+            &self.fields,
+            record_id,
+            session_id,
+            source_path,
+            source,
+        )?;
+        let Some(anchor) = anchors.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let predecessors = BooleanQuery::new(vec![
+            (
+                Occur::Should,
+                Box::new(RangeQuery::new_u64_bounds(
+                    "turn_id".to_string(),
+                    Bound::Unbounded,
+                    Bound::Excluded(u64::from(anchor.turn_id)),
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Should,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.turn_id, u64::from(anchor.turn_id)),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(RangeQuery::new_u64_bounds(
+                            "ts".to_string(),
+                            Bound::Unbounded,
+                            Bound::Excluded(anchor.ts),
+                        )) as Box<dyn Query>,
+                    ),
+                ])) as Box<dyn Query>,
+            ),
+            (
+                Occur::Should,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.turn_id, u64::from(anchor.turn_id)),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.ts, anchor.ts),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(RangeQuery::new_u64_bounds(
+                            "doc_id".to_string(),
+                            Bound::Unbounded,
+                            Bound::Excluded(anchor.doc_id),
+                        )) as Box<dyn Query>,
+                    ),
+                ])) as Box<dyn Query>,
+            ),
+        ]);
+        let before_query = session_query(
+            &self.fields,
+            session_id,
+            source_path,
+            source,
+            Some(Box::new(predecessors)),
+        );
+        let anchor_offset = searcher.search(&before_query, &Count)?;
+        let whole_session_query =
+            session_query(&self.fields, session_id, source_path, source, None);
+        let total = searcher.search(&whole_session_query, &Count)?;
+        let limit = limit.max(1).min(total);
+        let mut before_count = anchor_offset.min(limit / 2);
+        let after_available = total - anchor_offset;
+        let after_count = after_available.min(limit - before_count);
+        before_count = anchor_offset.min(limit - after_count);
+        let offset = anchor_offset - before_count;
+
+        let mut addresses = searcher
+            .search(
+                &before_query,
+                &TopDocs::with_limit(before_count.max(1))
+                    .custom_score(SessionReverseOrderScorerFactory),
+            )?
+            .into_iter()
+            .take(before_count)
+            .map(|(_, address)| address)
+            .collect::<Vec<_>>();
+
+        let successors = BooleanQuery::new(vec![
+            (
+                Occur::Should,
+                Box::new(RangeQuery::new_u64_bounds(
+                    "turn_id".to_string(),
+                    Bound::Excluded(u64::from(anchor.turn_id)),
+                    Bound::Unbounded,
+                )) as Box<dyn Query>,
+            ),
+            (
+                Occur::Should,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.turn_id, u64::from(anchor.turn_id)),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(RangeQuery::new_u64_bounds(
+                            "ts".to_string(),
+                            Bound::Excluded(anchor.ts),
+                            Bound::Unbounded,
+                        )) as Box<dyn Query>,
+                    ),
+                ])) as Box<dyn Query>,
+            ),
+            (
+                Occur::Should,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.turn_id, u64::from(anchor.turn_id)),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(TermQuery::new(
+                            Term::from_field_u64(self.fields.ts, anchor.ts),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    ),
+                    (
+                        Occur::Must,
+                        Box::new(RangeQuery::new_u64_bounds(
+                            "doc_id".to_string(),
+                            Bound::Included(anchor.doc_id),
+                            Bound::Unbounded,
+                        )) as Box<dyn Query>,
+                    ),
+                ])) as Box<dyn Query>,
+            ),
+        ]);
+        let after_query = session_query(
+            &self.fields,
+            session_id,
+            source_path,
+            source,
+            Some(Box::new(successors)),
+        );
+        addresses.extend(
+            searcher
+                .search(
+                    &after_query,
+                    &TopDocs::with_limit(after_count.max(1))
+                        .custom_score(SessionOrderScorerFactory),
+                )?
+                .into_iter()
+                .take(after_count)
+                .map(|(_, address)| address),
+        );
+        let mut records = addresses
+            .into_iter()
+            .map(|address| {
+                let doc = searcher.doc::<TantivyDocument>(address)?;
+                Ok(record_from_doc(&self.fields, &doc))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        records.sort_by(|a, b| {
+            a.turn_id
+                .cmp(&b.turn_id)
+                .then_with(|| a.ts.cmp(&b.ts))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        Ok(Some((records, total, offset)))
     }
 
     /// Read one globally ordered session page without materializing record content outside the
@@ -792,36 +1087,51 @@ impl SearchIndex {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<Record>, usize)> {
+        self.records_by_session_scope_page(session_id, source_path, None, offset, limit)
+    }
+
+    pub fn records_by_session_scope_page(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<Record>, usize)> {
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_text(self.fields.session_id, session_id),
-                IndexRecordOption::Basic,
-            )),
-        )];
-        if let Some(source_path) = source_path {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.source_path, source_path),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
-        let query = BooleanQuery::new(clauses);
+        let query = session_query(&self.fields, session_id, source_path, source, None);
         let total = searcher.search(&query, &Count)?;
         if offset >= total {
             return Ok((Vec::new(), total));
         }
         let page_limit = limit.max(1).min(total - offset);
-        let collector = TopDocs::with_limit(page_limit)
-            .and_offset(offset)
-            .custom_score(SessionOrderScorerFactory);
-        let top_docs = searcher.search(&query, &collector)?;
-        let mut records = Vec::with_capacity(top_docs.len());
-        for (_order, addr) in top_docs {
+        let remaining_after = total - offset - page_limit;
+        let addresses = if offset <= remaining_after {
+            searcher
+                .search(
+                    &query,
+                    &TopDocs::with_limit(page_limit)
+                        .and_offset(offset)
+                        .custom_score(SessionOrderScorerFactory),
+                )?
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect::<Vec<_>>()
+        } else {
+            searcher
+                .search(
+                    &query,
+                    &TopDocs::with_limit(page_limit)
+                        .and_offset(remaining_after)
+                        .custom_score(SessionReverseOrderScorerFactory),
+                )?
+                .into_iter()
+                .map(|(_, address)| address)
+                .collect::<Vec<_>>()
+        };
+        let mut records = Vec::with_capacity(addresses.len());
+        for addr in addresses {
             let doc = searcher.doc::<TantivyDocument>(addr)?;
             records.push(record_from_doc(&self.fields, &doc));
         }
@@ -832,6 +1142,38 @@ impl SearchIndex {
                 .then_with(|| a.doc_id.cmp(&b.doc_id))
         });
         Ok((records, total))
+    }
+
+    /// Return timestamp bounds for the complete exact session scope without hydrating content.
+    pub fn session_time_bounds(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+    ) -> Result<Option<(u64, u64)>> {
+        self.session_scope_time_bounds(session_id, source_path, None)
+    }
+
+    pub fn session_scope_time_bounds(
+        &self,
+        session_id: &str,
+        source_path: Option<&str>,
+        source: Option<crate::types::SourceKind>,
+    ) -> Result<Option<(u64, u64)>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let query = session_query(&self.fields, session_id, source_path, source, None);
+        let oldest: Vec<(u64, tantivy::DocAddress)> = searcher.search(
+            &query,
+            &TopDocs::with_limit(1).order_by_fast_field::<u64>("ts", Order::Asc),
+        )?;
+        let newest: Vec<(u64, tantivy::DocAddress)> = searcher.search(
+            &query,
+            &TopDocs::with_limit(1).order_by_fast_field::<u64>("ts", Order::Desc),
+        )?;
+        Ok(oldest
+            .first()
+            .zip(newest.first())
+            .map(|((oldest, _), (newest, _))| (*oldest, *newest)))
     }
 
     pub fn recent_records(&self, limit: usize) -> Result<Vec<Record>> {
@@ -851,6 +1193,16 @@ impl SearchIndex {
         limit: usize,
         source: Option<SourceFilter>,
         project: Option<&str>,
+    ) -> Result<Vec<Record>> {
+        self.recent_records_filtered_since(limit, source, project, None)
+    }
+
+    pub fn recent_records_filtered_since(
+        &self,
+        limit: usize,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        since: Option<u64>,
     ) -> Result<Vec<Record>> {
         let reader = self.reader()?;
         let searcher = reader.searcher();
@@ -879,6 +1231,16 @@ impl SearchIndex {
                 Box::new(TermQuery::new(
                     Term::from_field_text(self.fields.project, project),
                     IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        if let Some(since) = since {
+            clauses.push((
+                Occur::Must,
+                Box::new(RangeQuery::new_u64_bounds(
+                    "ts".to_string(),
+                    Bound::Included(since),
+                    Bound::Unbounded,
                 )),
             ));
         }
@@ -967,9 +1329,99 @@ fn exact_source_query(
     Some(Box::new(BooleanQuery::new(queries)))
 }
 
+fn records_by_canonical_id_in_session_scope(
+    searcher: &tantivy::Searcher,
+    fields: &IndexFields,
+    record_id: &str,
+    session_id: &str,
+    source_path: Option<&str>,
+    source: Option<crate::types::SourceKind>,
+) -> Result<Vec<Record>> {
+    let scope = if let Some(canonical_record_id) = fields.canonical_record_id {
+        session_query(
+            fields,
+            session_id,
+            source_path,
+            source,
+            Some(Box::new(TermQuery::new(
+                Term::from_field_text(canonical_record_id, record_id),
+                IndexRecordOption::Basic,
+            ))),
+        )
+    } else {
+        session_query(fields, session_id, source_path, source, None)
+    };
+    let limit = if fields.canonical_record_id.is_some() {
+        2
+    } else {
+        searcher.search(&scope, &Count)?
+    };
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let addresses = searcher.search(
+        &scope,
+        &TopDocs::with_limit(limit).custom_score(SessionOrderScorerFactory),
+    )?;
+    let mut matches = Vec::new();
+    for (_, address) in addresses {
+        let doc = searcher.doc::<TantivyDocument>(address)?;
+        let record = record_from_doc(fields, &doc);
+        if crate::retrieval::canonical_record_id(&record) == record_id {
+            matches.push(record);
+            if matches.len() == 2 {
+                break;
+            }
+        }
+    }
+    matches.sort_by(|a, b| {
+        a.turn_id
+            .cmp(&b.turn_id)
+            .then_with(|| a.ts.cmp(&b.ts))
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    Ok(matches)
+}
+
+fn session_query(
+    fields: &IndexFields,
+    session_id: &str,
+    source_path: Option<&str>,
+    source: Option<crate::types::SourceKind>,
+    extra: Option<Box<dyn Query>>,
+) -> BooleanQuery {
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(
+        Occur::Must,
+        Box::new(TermQuery::new(
+            Term::from_field_text(fields.session_id, session_id),
+            IndexRecordOption::Basic,
+        )),
+    )];
+    if let Some(source_path) = source_path {
+        clauses.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.source_path, source_path),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+    if let Some(source) = source
+        && let Some(query) = exact_source_query(fields, source)
+    {
+        clauses.push((Occur::Must, query));
+    }
+    if let Some(extra) = extra {
+        clauses.push((Occur::Must, extra));
+    }
+    BooleanQuery::new(clauses)
+}
+
 type SessionOrder = std::cmp::Reverse<(u64, u64, u64)>;
+type SessionReverseOrder = (u64, u64, u64);
 
 struct SessionOrderScorerFactory;
+struct SessionReverseOrderScorerFactory;
 
 struct SessionOrderScorer {
     turn_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
@@ -978,6 +1430,30 @@ struct SessionOrderScorer {
 }
 
 impl tantivy::collector::CustomScorer<SessionOrder> for SessionOrderScorerFactory {
+    type Child = SessionOrderScorer;
+
+    fn segment_scorer(
+        &self,
+        segment_reader: &tantivy::SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(SessionOrderScorer {
+            turn_ids: segment_reader
+                .fast_fields()
+                .u64("turn_id")?
+                .first_or_default_col(0),
+            timestamps: segment_reader
+                .fast_fields()
+                .u64("ts")?
+                .first_or_default_col(0),
+            doc_ids: segment_reader
+                .fast_fields()
+                .u64("doc_id")?
+                .first_or_default_col(0),
+        })
+    }
+}
+
+impl tantivy::collector::CustomScorer<SessionReverseOrder> for SessionReverseOrderScorerFactory {
     type Child = SessionOrderScorer;
 
     fn segment_scorer(
@@ -1011,6 +1487,16 @@ impl tantivy::collector::CustomSegmentScorer<SessionOrder> for SessionOrderScore
     }
 }
 
+impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrderScorer {
+    fn score(&mut self, doc: tantivy::DocId) -> SessionReverseOrder {
+        (
+            self.turn_ids.get_val(doc),
+            self.timestamps.get_val(doc),
+            self.doc_ids.get_val(doc),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum StaleSchemaPolicy {
     Error,
@@ -1037,6 +1523,7 @@ fn create_index_in_dir(dir: &Path) -> Result<SearchIndex> {
     Ok(SearchIndex {
         index,
         fields,
+        snapshot_version: snapshot_version_for_path(dir),
         writable: true,
         pending_generation: None,
         _generation_lease: None,
@@ -1056,6 +1543,7 @@ fn open_sealed_generation(dir: &Path) -> Result<SearchIndex> {
     Ok(SearchIndex {
         index,
         fields,
+        snapshot_version: snapshot_version_for_path(dir),
         writable: false,
         pending_generation: None,
         _generation_lease: Some(Arc::new(generation_lease)),
@@ -1070,6 +1558,28 @@ fn resolve_current_generation(index_root: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(index_root.join(GENERATIONS_DIR).join(name))
+}
+
+fn snapshot_version_for_path(path: &Path) -> String {
+    if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == GENERATIONS_DIR)
+    {
+        return path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown")
+            .trim_start_matches('.')
+            .trim_end_matches(".tmp")
+            .to_string();
+    }
+    let metadata = fs::read(path.join("meta.json")).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&metadata);
+    format!("legacy-{:x}", hasher.finalize())
 }
 
 fn new_generation_name() -> String {
@@ -1342,7 +1852,9 @@ fn build_schema() -> Result<Schema> {
     build_schema_with_canonical_record_id(true)
 }
 
-fn build_schema_with_canonical_record_id(include_canonical_record_id: bool) -> Result<Schema> {
+pub(crate) fn build_schema_with_canonical_record_id(
+    include_canonical_record_id: bool,
+) -> Result<Schema> {
     let mut builder = SchemaBuilder::default();
 
     if include_canonical_record_id {
@@ -1710,6 +2222,93 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_around_resolves_scoped_stored_record_ids() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let schema = build_schema_with_canonical_record_id(false).expect("legacy schema");
+        let raw = Index::create_in_dir(tmp.path(), schema).expect("legacy index");
+        drop(raw);
+
+        let index = SearchIndex::open_or_create(tmp.path()).expect("open legacy index");
+        let mut writer = index.writer().expect("legacy writer");
+        let before = test_record(1, "before");
+        let mut anchor = test_record(2, "anchor");
+        anchor.links.event_id = Some("shared-native-event".to_string());
+        let after = test_record(3, "after");
+        let mut other_path = anchor.clone();
+        other_path.doc_id = 4;
+        other_path.source_path = "other.jsonl".to_string();
+        for record in [&before, &anchor, &after, &other_path] {
+            index
+                .add_record(&mut writer, record)
+                .expect("add legacy record");
+        }
+        writer.commit().expect("commit legacy records");
+        let anchor_id = crate::retrieval::canonical_record_id(&anchor);
+
+        let resolved = index
+            .records_by_canonical_id_in_session_scope(
+                &anchor_id,
+                "session",
+                Some("session.jsonl"),
+                Some(crate::types::SourceKind::Codex),
+            )
+            .expect("resolve legacy anchor");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].doc_id, anchor.doc_id);
+
+        let (records, total, offset) = index
+            .records_by_session_scope_around(
+                "session",
+                Some("session.jsonl"),
+                Some(crate::types::SourceKind::Codex),
+                &anchor_id,
+                3,
+            )
+            .expect("legacy around read")
+            .expect("legacy anchor");
+        assert_eq!(total, 3);
+        assert_eq!(offset, 0);
+        assert_eq!(
+            records
+                .into_iter()
+                .map(|record| record.doc_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        for (record_id, path, source) in [
+            (
+                "rid1_missing",
+                "session.jsonl",
+                crate::types::SourceKind::Codex,
+            ),
+            (
+                anchor_id.as_str(),
+                "missing.jsonl",
+                crate::types::SourceKind::Codex,
+            ),
+            (
+                anchor_id.as_str(),
+                "session.jsonl",
+                crate::types::SourceKind::Claude,
+            ),
+        ] {
+            assert!(
+                index
+                    .records_by_session_scope_around(
+                        "session",
+                        Some(path),
+                        Some(source),
+                        record_id,
+                        3,
+                    )
+                    .expect("scoped legacy miss")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn canonical_and_session_path_lookups_use_exact_index_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let index = SearchIndex::open_or_create(tmp.path()).expect("index");
@@ -1736,6 +2335,40 @@ mod tests {
             .expect("session path lookup");
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].doc_id, first.doc_id);
+    }
+
+    #[test]
+    fn recent_records_since_uses_inclusive_indexed_timestamp_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        let mut records = [
+            test_record(1, "before"),
+            test_record(2, "boundary"),
+            test_record(3, "after"),
+            test_record(4, "other project"),
+            test_record(5, "other source"),
+        ];
+        for (record, ts) in records.iter_mut().zip([99, 100, 101, 102, 103]) {
+            record.ts = ts;
+        }
+        records[3].project = "other".to_string();
+        records[4].source = crate::types::SourceKind::Claude;
+        for record in &records {
+            index.add_record(&mut writer, record).expect("add record");
+        }
+        writer.commit().expect("commit records");
+
+        let recent = index
+            .recent_records_filtered_since(10, Some(SourceFilter::Codex), Some("memex"), Some(100))
+            .expect("recent range");
+        assert_eq!(
+            recent
+                .into_iter()
+                .map(|record| (record.ts, record.text))
+                .collect::<Vec<_>>(),
+            vec![(101, "after".to_string()), (100, "boundary".to_string())]
+        );
     }
 
     #[test]
@@ -1775,6 +2408,72 @@ mod tests {
         assert_eq!(total, 600);
         assert_eq!(second_total, total);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn session_around_uses_doc_id_to_rank_tied_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        let mut anchor_id = String::new();
+        for doc_id in (1..=1_200).rev() {
+            let mut record = test_record(doc_id, "same turn and timestamp");
+            record.turn_id = 7;
+            record.ts = 42;
+            record.links.event_id = Some(format!("event-{doc_id}"));
+            if doc_id == 600 {
+                anchor_id = crate::retrieval::canonical_record_id(&record);
+            }
+            index.add_record(&mut writer, &record).expect("add record");
+        }
+        writer.commit().expect("commit tied records");
+
+        let (records, total, offset) = index
+            .records_by_session_path_around("session", Some("session.jsonl"), &anchor_id, 5)
+            .expect("around page")
+            .expect("anchor");
+
+        assert_eq!(total, 1_200);
+        assert_eq!(offset, 597);
+        assert_eq!(
+            records
+                .into_iter()
+                .map(|record| record.doc_id)
+                .collect::<Vec<_>>(),
+            vec![598, 599, 600, 601, 602]
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_version_changes_after_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(1, "first"))
+            .expect("add first");
+        writer.commit().expect("commit first");
+        drop(writer);
+        drop(index);
+        let first = SearchIndex::open_or_create(tmp.path())
+            .expect("first snapshot")
+            .snapshot_version()
+            .to_string();
+
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(&mut writer, &test_record(2, "second"))
+            .expect("add second");
+        writer.commit().expect("commit second");
+        drop(writer);
+        drop(index);
+        let second = SearchIndex::open_or_create(tmp.path())
+            .expect("second snapshot")
+            .snapshot_version()
+            .to_string();
+
+        assert_ne!(first, second);
     }
 
     #[test]
