@@ -1,6 +1,6 @@
 use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analytics_path};
 use crate::config::{Paths, UserConfig};
-use crate::index::{QueryOptions, SearchIndex};
+use crate::index::{QueryOptions, SearchIndex, SessionScopeKey, TimestampOrder};
 use crate::types::SourceFilter;
 use crate::usage::{CostMode, UsageQuery, scan_usage, scan_usage_activity};
 use crate::web_auth::WebAuth;
@@ -513,6 +513,37 @@ struct ActivityPoint {
     value: u64,
 }
 
+#[derive(Default)]
+struct AllowedUsageScopes {
+    exact: HashSet<(String, String, String)>,
+    copilot_session_ids: HashSet<String>,
+}
+
+impl AllowedUsageScopes {
+    fn insert(&mut self, scope: (String, String, String)) {
+        if scope.0 == "copilot" {
+            self.copilot_session_ids.insert(scope.1.clone());
+        }
+        self.exact.insert(scope);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+    }
+
+    fn contains(&self, source: &str, session_id: &str, source_path: &str) -> bool {
+        if source == "copilot" {
+            self.copilot_session_ids.contains(session_id)
+        } else {
+            self.exact.contains(&(
+                source.to_string(),
+                session_id.to_string(),
+                source_path.to_string(),
+            ))
+        }
+    }
+}
+
 fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityPayload> {
     let config = UserConfig::load(paths)?;
     let token_usage_enabled = config.token_usage_enabled();
@@ -580,7 +611,10 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     )
                 })
                 .filter(|scope| matching_scopes.contains(scope))
-                .collect::<HashSet<_>>();
+                .fold(AllowedUsageScopes::default(), |mut scopes, scope| {
+                    scopes.insert(scope);
+                    scopes
+                });
             if allowed_scopes.is_empty() {
                 false
             } else {
@@ -602,11 +636,11 @@ fn activity_payload(paths: &Paths, params: &ActivityRequest) -> Result<ActivityP
                     let Some(session_id) = event.session_id else {
                         continue;
                     };
-                    if !allowed_scopes.contains(&(
-                        event.source.to_string(),
-                        session_id,
-                        event.source_path.to_string(),
-                    )) {
+                    if !allowed_scopes.contains(
+                        event.source,
+                        &session_id,
+                        event.source_path.as_ref(),
+                    ) {
                         continue;
                     }
                     add_activity_value(
@@ -1058,6 +1092,14 @@ struct SearchRequest {
     limit: usize,
     origin: SessionKindFilter,
     range: TimeRange,
+    sort: SearchSort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSort {
+    Relevance,
+    Newest,
+    Oldest,
 }
 
 impl SearchRequest {
@@ -1069,6 +1111,7 @@ impl SearchRequest {
         let mut limit = 50;
         let mut origin = SessionKindFilter::Primary;
         let mut range = TimeRange::All;
+        let mut requested_sort = None;
 
         for (key, value) in url.query_pairs() {
             match key {
@@ -1081,6 +1124,18 @@ impl SearchRequest {
                 }
                 "origin" => origin = parse_origin(value)?,
                 "range" => range = TimeRange::parse(value)?,
+                "sort" if !value.is_empty() => {
+                    requested_sort = Some(match value {
+                        "relevance" => SearchSort::Relevance,
+                        "newest" => SearchSort::Newest,
+                        "oldest" => SearchSort::Oldest,
+                        _ => {
+                            return Err(anyhow!(
+                                "unknown sort: {value} (expected relevance, newest, or oldest)"
+                            ));
+                        }
+                    });
+                }
                 "offset" => {
                     offset = value
                         .parse::<usize>()
@@ -1096,14 +1151,25 @@ impl SearchRequest {
             }
         }
 
+        let query = query.trim().to_string();
+        let sort = if query.is_empty() {
+            match requested_sort {
+                Some(SearchSort::Oldest) => SearchSort::Oldest,
+                _ => SearchSort::Newest,
+            }
+        } else {
+            requested_sort.unwrap_or(SearchSort::Relevance)
+        };
+
         Ok(Self {
-            query: query.trim().to_string(),
+            query,
             source,
             project,
             offset,
             limit,
             origin,
             range,
+            sort,
         })
     }
 }
@@ -1188,10 +1254,27 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let target = params.offset.saturating_add(params.limit).saturating_add(1);
     let document_count = index.doc_count()?.max(1);
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
-
+    let query_options = |limit| QueryOptions {
+        query: params.query.clone(),
+        project: params.project.clone(),
+        role: None,
+        tool: None,
+        session_id: None,
+        session_scope: None,
+        source: params.source,
+        since,
+        until: None,
+        limit,
+    };
+    let mut main_scope_cache = HashMap::new();
     let summaries = loop {
-        let records: Vec<(Option<f32>, crate::types::Record)> = if params.query.is_empty() {
-            index
+        let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
+            SearchSort::Relevance => index
+                .search(&query_options(candidate_limit))?
+                .into_iter()
+                .map(|(score, record)| (Some(score), record))
+                .collect(),
+            SearchSort::Newest if params.query.is_empty() => index
                 .recent_records_filtered_since(
                     candidate_limit,
                     params.source,
@@ -1200,24 +1283,19 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 )?
                 .into_iter()
                 .map(|record| (None, record))
-                .collect()
-        } else {
-            index
-                .search(&QueryOptions {
-                    query: params.query.clone(),
-                    project: params.project.clone(),
-                    role: None,
-                    tool: None,
-                    session_id: None,
-                    session_scope: None,
-                    source: params.source,
-                    since,
-                    until: None,
-                    limit: candidate_limit,
-                })?
+                .collect(),
+            SearchSort::Newest | SearchSort::Oldest => index
+                .search_by_timestamp(
+                    &query_options(candidate_limit),
+                    if params.sort == SearchSort::Newest {
+                        TimestampOrder::Newest
+                    } else {
+                        TimestampOrder::Oldest
+                    },
+                )?
                 .into_iter()
-                .map(|(score, record)| (Some(score), record))
-                .collect()
+                .map(|record| (None, record))
+                .collect(),
         };
 
         let raw_count = records.len();
@@ -1239,6 +1317,50 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     }
                 })
                 .or_insert_with(|| record.links.conversation_kind.clone());
+        }
+        if params.origin != SessionKindFilter::All
+            && matches!(params.sort, SearchSort::Newest | SearchSort::Oldest)
+            && (params.sort == SearchSort::Oldest || !params.query.is_empty())
+        {
+            let candidate_scopes = records
+                .iter()
+                .filter_map(|(_, record)| {
+                    let key = (
+                        record.source.storage_label().to_string(),
+                        record.session_id.clone(),
+                        record.source_path.clone(),
+                    );
+                    (group_kind.get(&key).and_then(|kind| kind.as_deref()) != Some("main")).then(
+                        || SessionScopeKey {
+                            source: record.source,
+                            session_id: record.session_id.clone(),
+                            source_path: record.source_path.clone(),
+                        },
+                    )
+                })
+                .collect::<HashSet<_>>();
+            for scope in candidate_scopes {
+                let has_main = if let Some(has_main) = main_scope_cache.get(&scope) {
+                    *has_main
+                } else {
+                    let has_main = index.session_scope_has_matching_conversation_kind(
+                        &query_options(1),
+                        &scope,
+                        "main",
+                    )?;
+                    main_scope_cache.insert(scope.clone(), has_main);
+                    has_main
+                };
+                if has_main
+                    && let Some(kind) = group_kind.get_mut(&(
+                        scope.source.storage_label().to_string(),
+                        scope.session_id,
+                        scope.source_path,
+                    ))
+                {
+                    *kind = Some("main".to_string());
+                }
+            }
         }
         let mut seen = HashSet::new();
         let mut summaries = Vec::new();
@@ -1899,6 +2021,27 @@ mod tests {
         assert_eq!(request.project.as_deref(), Some("memex"));
         assert_eq!(request.offset, 200);
         assert_eq!(request.limit, 100);
+        assert_eq!(request.sort, SearchSort::Relevance);
+
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Newest
+        );
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search?sort=relevance").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Newest
+        );
+        assert_eq!(
+            SearchRequest::from_url(&parse_url("/api/search?q=needle&sort=oldest").unwrap())
+                .unwrap()
+                .sort,
+            SearchSort::Oldest
+        );
+        assert!(SearchRequest::from_url(&parse_url("/api/search?sort=sideways").unwrap()).is_err());
     }
 
     #[test]
@@ -1931,7 +2074,7 @@ mod tests {
         drop(analytics);
         publish_records(&paths, records);
         for (range, expected) in [("24h", 2), ("7d", 3), ("30d", 4), ("all", 5)] {
-            for query in ["", "needle"] {
+            for query in ["", "needle", "needle&sort=oldest"] {
                 let request = SearchRequest::from_url(
                     &parse_url(&format!("/api/search?range={range}&q={query}")).unwrap(),
                 )
@@ -2365,6 +2508,91 @@ mod tests {
     }
 
     #[test]
+    fn token_activity_query_correlates_copilot_session_state_with_otel_usage() {
+        use crate::analytics::AnalyticsWriter;
+        use crate::test_support::{EnvVarGuard, env_lock};
+
+        let _guard = env_lock();
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.root.join("config.toml"), "token_usage = true\n").unwrap();
+
+        let copilot_root = temp.path().join("copilot");
+        let session_path = |session_id: &str| {
+            copilot_root
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl")
+        };
+        let matching_path = session_path("matching-session");
+        let other_path = session_path("other-session");
+        std::fs::create_dir_all(matching_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(other_path.parent().unwrap()).unwrap();
+        std::fs::write(&matching_path, "").unwrap();
+        std::fs::write(&other_path, "").unwrap();
+        let otel_dir = copilot_root.join("otel");
+        std::fs::create_dir_all(&otel_dir).unwrap();
+        let span = |trace: &str, session: &str, input: u64| {
+            format!(
+                r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{"name":"chat","traceId":"{trace}","spanId":"span","startTimeUnixNano":"1750000000000000000","attributes":[{{"key":"gen_ai.usage.input_tokens","value":{{"intValue":"{input}"}}}},{{"key":"gen_ai.conversation.id","value":{{"stringValue":"{session}"}}}}]}}]}}]}}]}}"#
+            )
+        };
+        std::fs::write(
+            otel_dir.join("usage.jsonl"),
+            format!(
+                "{}\n{}\n",
+                span("matching-trace", "matching-session", 10),
+                span("other-trace", "other-session", 90)
+            ),
+        )
+        .unwrap();
+        let _env = EnvVarGuard::set_os(&[("COPILOT_HOME", Some(copilot_root.as_os_str()))]);
+
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        let mut matching = record(
+            1,
+            "matching-session",
+            matching_path.to_string_lossy().as_ref(),
+            "searchtrino".to_string(),
+        );
+        matching.source = SourceKind::Copilot;
+        matching.ts = now;
+        let mut other = record(
+            2,
+            "other-session",
+            other_path.to_string_lossy().as_ref(),
+            "unrelated".to_string(),
+        );
+        other.source = SourceKind::Copilot;
+        other.ts = now;
+        let records = vec![matching, other];
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for value in &records {
+            analytics.record(value).unwrap();
+        }
+        analytics.flush().unwrap();
+        drop(analytics);
+        publish_records(&paths, records);
+
+        let request = ActivityRequest::from_url(
+            &parse_url(
+                "/api/activity?metric=tokens&range=all&origin=all&source=copilot&q=searchtrino",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let total = activity_payload(&paths, &request)
+            .unwrap()
+            .points
+            .iter()
+            .map(|point| point.value)
+            .sum::<u64>();
+
+        assert_eq!(total, 10);
+    }
+
+    #[test]
     fn requests_default_to_interactive_origin() {
         let search = SearchRequest::from_url(&parse_url("/api/search?q=hi").unwrap()).unwrap();
         assert_eq!(search.origin, SessionKindFilter::Primary);
@@ -2445,6 +2673,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2462,6 +2691,7 @@ mod tests {
                 limit: 1,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2478,6 +2708,7 @@ mod tests {
                 limit: 1,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2518,10 +2749,118 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Newest,
             },
         )
         .unwrap();
         assert!(filtered.results.is_empty());
+    }
+
+    #[test]
+    fn search_sort_orders_complete_filtered_session_set_before_pagination() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut records = (1..=110)
+            .map(|doc_id| {
+                let mut value = record(doc_id, "dense", "/tmp/dense.jsonl", "needle".to_string());
+                value.ts = 10_000 + doc_id;
+                value
+            })
+            .collect::<Vec<_>>();
+        for (doc_id, session_id, ts, text) in [
+            (200, "second", 9_000, "needle".to_string()),
+            (201, "third", 8_000, "needle".to_string()),
+            (300, "relevant", 100, "needle ".repeat(12)),
+        ] {
+            let mut value = record(
+                doc_id,
+                session_id,
+                &format!("/tmp/{session_id}.jsonl"),
+                text,
+            );
+            value.ts = ts;
+            records.push(value);
+        }
+        let mut outsider = record(400, "outsider", "/tmp/outsider.jsonl", "needle".to_string());
+        outsider.source = SourceKind::Codex;
+        outsider.project = "other".to_string();
+        outsider.ts = 50_000;
+        records.push(outsider);
+        publish_records(&paths, records);
+
+        let payload = |query: &str| {
+            search_payload(
+                &paths,
+                &SearchRequest::from_url(&parse_url(query).unwrap()).unwrap(),
+            )
+            .unwrap()
+        };
+        let relevance = payload(
+            "/api/search?q=needle&sort=relevance&source=claude&project=memex&origin=all&limit=1",
+        );
+        assert_eq!(relevance.results[0].session_id, "relevant");
+        assert!(relevance.results[0].score.is_some());
+
+        let newest = payload(
+            "/api/search?q=needle&sort=newest&source=claude&project=memex&origin=all&limit=1",
+        );
+        assert_eq!(newest.results[0].session_id, "dense");
+        assert_eq!(newest.results[0].ts, 10_110);
+        assert!(newest.has_more);
+
+        // The first 100 timestamp-ordered matching records all belong to `dense`. Page two must
+        // still be selected from the globally grouped session order, not from a loaded UI page.
+        let second_page = payload(
+            "/api/search?q=needle&sort=newest&source=claude&project=memex&origin=all&offset=1&limit=1",
+        );
+        assert_eq!(second_page.results[0].session_id, "second");
+        assert_eq!(second_page.results[0].ts, 9_000);
+        assert!(second_page.has_more);
+
+        let oldest =
+            payload("/api/search?sort=oldest&source=claude&project=memex&origin=all&limit=1");
+        assert_eq!(oldest.results[0].session_id, "relevant");
+        assert_eq!(oldest.results[0].ts, 100);
+    }
+
+    #[test]
+    fn chronological_representative_survives_prefer_main_origin_classification() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut records = (1..=110)
+            .map(|doc_id| {
+                let mut value = record(doc_id, "mixed", "/tmp/mixed.jsonl", "needle".to_string());
+                value.ts = doc_id;
+                value.links.conversation_kind = Some("sidechain".to_string());
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut other = record(200, "other", "/tmp/other.jsonl", "needle".to_string());
+        other.ts = 200;
+        other.links.conversation_kind = Some("main".to_string());
+        records.push(other);
+        let mut main = record(300, "mixed", "/tmp/mixed.jsonl", "needle".to_string());
+        main.ts = 10_000;
+        main.links.conversation_kind = Some("main".to_string());
+        records.push(main);
+        let expected_record_id = crate::retrieval::canonical_record_id(&records[0]);
+        publish_records(&paths, records);
+
+        let payload = search_payload(
+            &paths,
+            &SearchRequest::from_url(
+                &parse_url("/api/search?q=needle&sort=oldest&origin=interactive&limit=1").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload.results[0].session_id, "mixed");
+        assert_eq!(payload.results[0].ts, 1);
+        assert_eq!(payload.results[0].record_id, expected_record_id);
+        assert!(payload.has_more);
     }
 
     #[test]
@@ -2548,6 +2887,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2577,6 +2917,7 @@ mod tests {
                 limit: 30,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Newest,
             },
         )
         .unwrap();
@@ -2710,6 +3051,7 @@ mod tests {
                 limit: 10,
                 origin: SessionKindFilter::Primary,
                 range: TimeRange::All,
+                sort: SearchSort::Relevance,
             },
         )
         .unwrap();
@@ -2939,6 +3281,7 @@ mod tests {
                     limit: 30,
                     origin,
                     range: TimeRange::All,
+                    sort: SearchSort::Relevance,
                 },
             )
             .unwrap()
