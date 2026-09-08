@@ -37,6 +37,10 @@ struct ChildGuard {
 
 impl ChildGuard {
     fn spawn(dirs: &TestDirs, args: &[&str]) -> Self {
+        Self::spawn_with_env(dirs, args, &[])
+    }
+
+    fn spawn_with_env(dirs: &TestDirs, args: &[&str], environment: &[(&str, &Path)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_memex"));
         command
             .arg("--no-update-check")
@@ -46,6 +50,9 @@ impl ChildGuard {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let mut child = command.spawn().expect("start Memex child");
         let logs = Arc::new(Mutex::new(Vec::new()));
         drain(child.stdout.take().unwrap(), Arc::clone(&logs));
@@ -404,4 +411,183 @@ fn malformed_mcp_public_url_fails_startup_without_a_live_listener() {
         "daemon accepted a malformed MCP public URL"
     );
     assert_listener_closes(mcp);
+}
+
+fn wait_for_log(child: &mut ChildGuard, needle: &str, timeout_secs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if child.diagnostics().contains(needle) {
+            return;
+        }
+        child.assert_running();
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {needle:?}: {}", child.diagnostics());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn spawn_index_daemon(dirs: &TestDirs, extra: &[&str]) -> ChildGuard {
+    let root = dirs.root.path().to_str().unwrap();
+    let claude = dirs.claude.path().to_str().unwrap();
+    let mut args = vec![
+        "daemon",
+        "run",
+        "--root",
+        root,
+        "--only-source",
+        "claude",
+        "--claude-path",
+        claude,
+        "--no-embeddings",
+    ];
+    args.extend_from_slice(extra);
+    ChildGuard::spawn(&dirs, &args)
+}
+
+const MINIMAL_CLAUDE_LINE: &str = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]},\"uuid\":\"u1\",\"timestamp\":\"2024-01-01T00:00:00Z\"}\n";
+
+#[test]
+fn daemon_event_mode_indexes_new_transcripts_without_resync() {
+    let dirs = TestDirs::new();
+    // Resync an hour out: if the transcript gets indexed, events did it.
+    let mut daemon = spawn_index_daemon(
+        &dirs,
+        &["--watch-mode", "events", "--poll-interval", "3600"],
+    );
+    wait_for_log(&mut daemon, "indexed 0 records", 60);
+
+    std::fs::write(
+        dirs.claude.path().join("session.jsonl"),
+        MINIMAL_CLAUDE_LINE,
+    )
+    .expect("write transcript");
+    wait_for_log(&mut daemon, "indexed 1 records", 90);
+    daemon.stop();
+}
+
+#[test]
+fn daemon_poll_mode_still_indexes_on_interval() {
+    let dirs = TestDirs::new();
+    let mut daemon = spawn_index_daemon(&dirs, &["--watch-mode", "poll", "--poll-interval", "1"]);
+    wait_for_log(&mut daemon, "indexed 0 records", 60);
+
+    std::fs::write(
+        dirs.claude.path().join("session.jsonl"),
+        MINIMAL_CLAUDE_LINE,
+    )
+    .expect("write transcript");
+    wait_for_log(&mut daemon, "indexed 1 records", 60);
+    daemon.stop();
+}
+
+#[test]
+fn daemon_event_mode_scans_only_the_changed_transcript() {
+    let dirs = TestDirs::new();
+    let first = dirs.claude.path().join("first.jsonl");
+    std::fs::write(&first, MINIMAL_CLAUDE_LINE).unwrap();
+    std::fs::write(dirs.claude.path().join("second.jsonl"), MINIMAL_CLAUDE_LINE).unwrap();
+    let mut daemon = spawn_index_daemon(
+        &dirs,
+        &["--watch-mode", "events", "--poll-interval", "3600"],
+    );
+    wait_for_log(&mut daemon, "indexed 2 records across 2 files", 60);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&first)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "uuid": "u2",
+                "message": {"role": "user", "content": "appended"},
+            })
+        )
+        .unwrap();
+    }
+    wait_for_log(&mut daemon, "indexed 1 records across 1 files", 90);
+    daemon.stop();
+}
+
+fn wait_for_session_text(daemon: &mut ChildGuard, root: &Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if root.join("index/CURRENT").exists()
+            && let Ok(index) = memex::index::SearchIndex::open_or_create(&root.join("index"))
+            && let Ok(records) = index.records_by_session_id("wal-session")
+            && records.iter().any(|record| record.text == expected)
+        {
+            return;
+        }
+        daemon.assert_running();
+        assert!(
+            Instant::now() < deadline,
+            "WAL update {expected:?} was not indexed: {}",
+            daemon.diagnostics()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn daemon_event_mode_indexes_held_open_wal_without_resync() {
+    let dirs = TestDirs::new();
+    let source = tempfile::tempdir().unwrap();
+    let database = source.path().join("opencode-work.db");
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer.execute_batch(r#"
+        PRAGMA journal_mode=WAL;
+        PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT);
+        CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+        INSERT INTO session VALUES ('wal-session', NULL, '/wal-test', 1, 2);
+        INSERT INTO message VALUES ('message', 'wal-session', 3, '{"role":"assistant"}');
+        INSERT INTO part VALUES ('part', 'message', '{"type":"text","text":"before WAL commit"}');
+        INSERT INTO event VALUES ('event-1', 'wal-session');
+    "#).unwrap();
+    let mut daemon = ChildGuard::spawn_with_env(
+        &dirs,
+        &[
+            "daemon",
+            "run",
+            "--root",
+            dirs.root.path().to_str().unwrap(),
+            "--only-source",
+            "opencode",
+            "--no-embeddings",
+            "--watch-mode",
+            "events",
+            "--poll-interval",
+            "3600",
+        ],
+        &[("OPENCODE_DATA_DIR", source.path())],
+    );
+    wait_for_session_text(&mut daemon, dirs.root.path(), "before WAL commit");
+    let before = std::fs::metadata(&database).unwrap();
+    // Keep the writer and WAL open through multiple commits. On macOS the
+    // sweep must observe the updates even when FSEvents defers delivery.
+    for (event, text) in [
+        ("event-2", "first WAL commit"),
+        ("event-3", "second WAL commit"),
+    ] {
+        writer
+            .execute(
+                "UPDATE part SET data = ?1 WHERE id = 'part'",
+                [json!({"type": "text", "text": text}).to_string()],
+            )
+            .unwrap();
+        writer
+            .execute("INSERT INTO event VALUES (?1, 'wal-session')", [event])
+            .unwrap();
+        let after = std::fs::metadata(&database).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        wait_for_session_text(&mut daemon, dirs.root.path(), text);
+    }
+    daemon.stop();
 }
