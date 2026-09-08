@@ -6,7 +6,7 @@ use crate::types::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -37,6 +37,14 @@ pub struct SessionRow {
     pub message_count: u64,
     pub label: Option<String>,
     pub conversation_kind: Option<String>,
+}
+
+/// Full-index repository totals, keyed exactly like the sessions project filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project: String,
+    pub session_count: u64,
+    pub last_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,72 +449,39 @@ impl AnalyticsStore {
         kind: Option<SessionKindFilter>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
+        self.query_sessions_detailed_selected(
+            source, project, cwd, since_ms, kind, None, None, limit,
+        )
+    }
+
+    /// Apply exact identity selectors together with all listing filters before limiting rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_sessions_detailed_selected(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        kind: Option<SessionKindFilter>,
+        session_id: Option<&str>,
+        source_path: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionDetailRow>> {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project, repo_project,
                     cwd, git_root, started_at, last_at, message_count, label, conversation_kind
              FROM sessions",
         );
-        let mut clauses = Vec::new();
-        let mut values: Vec<rusqlite::types::Value> = Vec::new();
-
-        if let Some(source) = source {
-            let labels = source.storage_labels();
-            let placeholders = std::iter::repeat_n("?", labels.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            clauses.push(format!("source IN ({placeholders})"));
-            values.extend(
-                labels
-                    .iter()
-                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
-            );
-        }
-        if let Some(project) = project {
-            clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
-            values.push(rusqlite::types::Value::Text(project.to_string()));
-        }
-        if let Some(cwd) = cwd {
-            let root = cwd.trim_end_matches('/').to_string();
-            // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
-            // match sessions under /tmp/fooXbar.
-            let escaped = root
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
-            values.push(rusqlite::types::Value::Text(root.clone()));
-            values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
-            values.push(rusqlite::types::Value::Text(root));
-        }
-        if let Some(since_ms) = since_ms {
-            clauses.push("last_at >= ?".to_string());
-            values.push(rusqlite::types::Value::Integer(since_ms as i64));
-        }
-        if let Some(kind) = kind {
-            match kind {
-                SessionKindFilter::Primary => {
-                    clauses.push(
-                        "(conversation_kind IS NULL OR conversation_kind = 'main')".to_string(),
-                    );
-                }
-                SessionKindFilter::Subagent => {
-                    clauses.push(
-                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
-                    );
-                }
-                SessionKindFilter::Regular => {
-                    clauses.push(
-                        "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
-                            .to_string(),
-                    );
-                }
-                SessionKindFilter::All => {}
-            }
-        }
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
-        }
+        let (predicate, mut values) = session_selection_sql(
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            session_id,
+            source_path,
+        );
+        sql.push_str(&predicate);
         sql.push_str(" ORDER BY last_at DESC");
         if let Some(limit) = limit {
             sql.push_str(" LIMIT ?");
@@ -541,6 +516,63 @@ impl AnalyticsStore {
         Ok(out)
     }
 
+    /// Count exactly the same identities and predicates as session listing, without detail rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_sessions_selected(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        kind: Option<SessionKindFilter>,
+        session_id: Option<&str>,
+        source_path: Option<&str>,
+    ) -> Result<u64> {
+        let (predicate, values) = session_selection_sql(
+            source,
+            project,
+            cwd,
+            since_ms,
+            kind,
+            session_id,
+            source_path,
+        );
+        Ok(self.conn.query_row(
+            &format!("SELECT count(*) FROM sessions{predicate}"),
+            params_from_iter(values),
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Count indexed identities using canonical whole-session origin metadata.
+    /// A missing row is distinct from a known primary session with a NULL kind.
+    pub fn count_session_scopes(
+        &self,
+        scopes: &HashSet<(SourceKind, String, String)>,
+        kind: SessionKindFilter,
+    ) -> Result<Option<u64>> {
+        if kind == SessionKindFilter::All {
+            return Ok(Some(scopes.len() as u64));
+        }
+        let mut stmt = self.conn.prepare("SELECT conversation_kind FROM sessions WHERE source = ?1 AND session_id = ?2 AND source_path = ?3")?;
+        let mut count = 0;
+        for (source, session_id, source_path) in scopes {
+            let metadata = stmt
+                .query_row(
+                    params![source.storage_label(), session_id, source_path],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            let Some(metadata) = metadata else {
+                return Ok(None);
+            };
+            if kind.matches_kind(metadata.as_deref().filter(|value| !value.is_empty())) {
+                count += 1;
+            }
+        }
+        Ok(Some(count))
+    }
+
     /// Stored conversation kind for one exact session identity, if the
     /// analytics cache has a row for it. Search-result grouping uses this
     /// complete-session truth so a session is never classified from only
@@ -564,6 +596,52 @@ impl AnalyticsStore {
             .flatten()
             .flatten()
             .filter(|kind| !kind.is_empty())
+    }
+
+    /// Aggregate in SQLite rather than materializing every session in the client.
+    /// One stored row is one (source, session_id, source_path) session identity.
+    /// Match repository grouping and the default regular-session filter.
+    pub fn query_project_summaries(
+        &self,
+        source: Option<SourceFilter>,
+    ) -> Result<Vec<ProjectSummary>> {
+        let mut sql = format!(
+            "with project_sessions as (
+                select {REPOSITORY_PROJECT_SQL} as project,
+                       last_at
+                from sessions
+                where (conversation_kind is null or conversation_kind != 'guardian_review')",
+        );
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(source) = source {
+            let labels = source.storage_labels();
+            let placeholders = std::iter::repeat_n("?", labels.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" and source in ({placeholders})"));
+            values.extend(
+                labels
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+        }
+        sql.push_str(
+            ")
+             select project, count(*) as session_count,
+                    max(case when last_at > 0 then last_at end) as last_at
+             from project_sessions
+             group by project
+             order by last_at desc, project asc",
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), |row| {
+            Ok(ProjectSummary {
+                project: row.get(0)?,
+                session_count: row.get(1)?,
+                last_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn query_projects(
@@ -1947,6 +2025,89 @@ pub fn backfill_from_index(
     writer.store.mark_complete()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn session_selection_sql(
+    source: Option<SourceFilter>,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    since_ms: Option<u64>,
+    kind: Option<SessionKindFilter>,
+    session_id: Option<&str>,
+    source_path: Option<&str>,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let mut clauses = Vec::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+
+    if let Some(session_id) = session_id {
+        clauses.push("session_id = ?".to_string());
+        values.push(rusqlite::types::Value::Text(session_id.to_string()));
+    }
+    if let Some(source_path) = source_path {
+        clauses.push("source_path = ?".to_string());
+        values.push(rusqlite::types::Value::Text(source_path.to_string()));
+    }
+
+    if let Some(source) = source {
+        let labels = source.storage_labels();
+        let placeholders = std::iter::repeat_n("?", labels.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("source IN ({placeholders})"));
+        values.extend(
+            labels
+                .iter()
+                .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+        );
+    }
+    if let Some(project) = project {
+        clauses.push(format!("{REPOSITORY_PROJECT_SQL} = ?"));
+        values.push(rusqlite::types::Value::Text(project.to_string()));
+    }
+    if let Some(cwd) = cwd {
+        let root = cwd.trim_end_matches('/').to_string();
+        // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
+        // match sessions under /tmp/fooXbar.
+        let escaped = root
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
+        values.push(rusqlite::types::Value::Text(root.clone()));
+        values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
+        values.push(rusqlite::types::Value::Text(root));
+    }
+    if let Some(since_ms) = since_ms {
+        clauses.push("last_at >= ?".to_string());
+        values.push(rusqlite::types::Value::Integer(since_ms as i64));
+    }
+    if let Some(kind) = kind {
+        match kind {
+            SessionKindFilter::Primary => {
+                clauses
+                    .push("(conversation_kind IS NULL OR conversation_kind = 'main')".to_string());
+            }
+            SessionKindFilter::Subagent => {
+                clauses.push(
+                        "conversation_kind IS NOT NULL AND conversation_kind NOT IN ('main', 'guardian_review')".to_string(),
+                    );
+            }
+            SessionKindFilter::Regular => {
+                clauses.push(
+                    "(conversation_kind IS NULL OR conversation_kind != 'guardian_review')"
+                        .to_string(),
+                );
+            }
+            SessionKindFilter::All => {}
+        }
+    }
+    let predicate = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    (predicate, values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,6 +2173,141 @@ mod tests {
             links: RecordLinks::default(),
             source_path: source_path.to_string_lossy().to_string(),
         }
+    }
+
+    #[test]
+    fn detailed_sessions_exact_selectors_apply_before_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, started_at, last_at) values
+             ('codex', 'shared', '/old', 'target', 1, 1),
+             ('codex', 'shared', '/new', 'target', 2, 2),
+             ('codex', 'other', '/old', 'target', 3, 3),
+             ('claude', 'shared', '/old', 'target', 4, 4);",
+        ).unwrap();
+        let query = |session_id, source_path| {
+            store
+                .query_sessions_detailed_selected(
+                    Some(SourceFilter::Codex),
+                    None,
+                    None,
+                    None,
+                    None,
+                    session_id,
+                    source_path,
+                    Some(1),
+                )
+                .unwrap()
+        };
+        let exact = query(Some("shared"), Some("/old"));
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].last_at, 1);
+        assert_eq!(exact[0].source, SourceKind::Codex);
+        assert_eq!(query(Some("shared"), None)[0].source_path, "/new");
+        assert_eq!(query(None, Some("/old"))[0].session_id, "other");
+        assert!(query(Some("missing"), Some("/old")).is_empty());
+        assert!(query(Some("shared"), Some("/old%")).is_empty());
+        assert!(
+            store
+                .query_sessions_detailed_selected(
+                    Some(SourceFilter::Codex),
+                    Some("different"),
+                    None,
+                    None,
+                    None,
+                    Some("shared"),
+                    Some("/old"),
+                    Some(1),
+                )
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_summaries_count_the_full_index_and_group_repositories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch("begin").unwrap();
+        for index in 0..250 {
+            store.conn.execute(
+                "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at)
+                 values ('codex', ?1, ?2, ?3, 'repo', 0, ?4)",
+                params![format!("session-{index}"), format!("/path/{index}"), format!("worktree-{index}"), index + 1],
+            ).unwrap();
+        }
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at) values
+             ('claude', 'session-0', '/path/0', 'raw', 'repo', 0, 999),
+             ('codex', 'session-0', '/other-path', 'raw', 'repo', 0, 998),
+             ('codex', 'older', '/older', 'older', '', 0, 12),
+             ('codex', 'blank', '/blank', '   ', null, 0, 5000);
+             insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at, conversation_kind) values
+             ('codex', 'review', '/review', 'raw', 'repo', 0, 9000, 'guardian_review'),
+             ('codex', 'review-only', '/review-only', 'raw', 'review-only', 0, 9001, 'guardian_review'),
+             ('codex', 'unfiled-review', '/unfiled-review', 'raw', null, 0, 9002, 'guardian_review'),
+             ('codex', 'agent', '/agent', 'raw', 'repo', 0, 900, 'subagent');
+             commit;",
+        ).unwrap();
+        let summaries = store.query_project_summaries(None).unwrap();
+        assert_eq!(
+            summaries,
+            vec![
+                ProjectSummary {
+                    project: UNFILED_PROJECT.into(),
+                    session_count: 2,
+                    last_at: Some(5000)
+                },
+                ProjectSummary {
+                    project: "repo".into(),
+                    session_count: 253,
+                    last_at: Some(999)
+                },
+            ]
+        );
+        for summary in &summaries {
+            let matching = store
+                .query_sessions_detailed_filtered(
+                    None,
+                    Some(&summary.project),
+                    None,
+                    None,
+                    Some(SessionKindFilter::Regular),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(matching.len() as u64, summary.session_count);
+        }
+        let codex = store
+            .query_project_summaries(Some(SourceFilter::Codex))
+            .unwrap();
+        assert_eq!(codex[1].session_count, 252);
+        assert_eq!(codex[1].last_at, Some(998));
+    }
+
+    #[test]
+    fn project_summaries_sort_ties_and_preserve_filter_keys_and_unknown_dates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AnalyticsStore::open(tmp.path().join("analytics.sqlite")).unwrap();
+        store.conn.execute_batch(
+            "insert into sessions (source, session_id, source_path, project, repo_project, started_at, last_at) values
+             ('codex', 'b', '/b', 'raw', 'b', 0, 10),
+             ('codex', 'a', '/a', 'raw', 'a', 0, 10),
+             ('codex', 'zero', '/zero', 'raw', 'unknown', 0, 0),
+             ('codex', 'negative', '/negative', 'raw', 'unknown', 0, -1),
+             ('codex', 'encoded', '/encoded', 'raw', '-Users-nico-Code-project', 0, 0);",
+        ).unwrap();
+        let rows = store.query_project_summaries(None).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.project.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "-Users-nico-Code-project", "unknown"]
+        );
+        assert_eq!(rows[2].last_at, None);
+        assert_eq!(rows[3].last_at, None);
+        assert_eq!(rows[3].session_count, 2);
     }
 
     #[test]
@@ -2151,6 +2447,20 @@ mod tests {
                 None,
             )
             .expect("scoped sessions");
+        assert_eq!(
+            store
+                .count_sessions_selected(
+                    None,
+                    None,
+                    Some(target.to_string_lossy().as_ref()),
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .unwrap(),
+            1
+        );
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].session_id, "s-target");
     }

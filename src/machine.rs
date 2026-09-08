@@ -297,6 +297,16 @@ pub struct Federated<T> {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum RpcOperation {
     Ping,
+    Projects {
+        source: Option<SourceFilter>,
+    },
+    Sessions {
+        request: crate::cli::SessionsRequest,
+    },
+    SessionCount {
+        request: crate::cli::SessionsRequest,
+        query: Option<String>,
+    },
     MemorySearch {
         options: MemorySearchOptions,
     },
@@ -367,6 +377,15 @@ struct RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RpcPayload {
+    Projects {
+        projects: Vec<serde_json::Value>,
+    },
+    Sessions {
+        sessions: Vec<serde_json::Value>,
+    },
+    SessionCount {
+        count: crate::cli::SessionCount,
+    },
     Pong {
         version: String,
     },
@@ -1781,6 +1800,91 @@ pub fn federated_session_activity(
     Ok((points, !errors.is_empty()))
 }
 
+/// Discovery deliberately ignores the configured default search subset and never
+/// exposes transport commands, hosts, credentials, or index configuration.
+pub fn configured_machine_summaries(config: &UserConfig) -> Result<Vec<serde_json::Value>> {
+    let mut items = vec![serde_json::json!({"id": LOCAL_MACHINE_ID, "label": "This Mac"})];
+    let mut seen = HashSet::from([LOCAL_MACHINE_ID.to_string()]);
+    for machine in config.machines.iter().filter(|machine| machine.enabled()) {
+        validate_machine(machine)?;
+        if !seen.insert(machine.id.clone()) {
+            bail!("duplicate machine id '{}'", machine.id);
+        }
+        items.push(serde_json::json!({
+            "id": machine.id,
+            "label": machine.label.as_deref().filter(|label| !label.trim().is_empty()).unwrap_or(&machine.id),
+        }));
+    }
+    Ok(items)
+}
+
+pub(crate) fn remote_project_summaries(
+    config: &UserConfig,
+    id: &str,
+    source: Option<SourceFilter>,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(config, id, RpcOperation::Projects { source }, "projects")? {
+        RpcPayload::Projects { projects } => Ok(projects),
+        _ => bail!("machine '{id}' returned an unexpected projects metadata response"),
+    }
+}
+
+pub(crate) fn remote_sessions(
+    config: &UserConfig,
+    id: &str,
+    request: crate::cli::SessionsRequest,
+) -> Result<Vec<serde_json::Value>> {
+    match metadata_rpc(config, id, RpcOperation::Sessions { request }, "sessions")? {
+        RpcPayload::Sessions { sessions } => Ok(sessions),
+        _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
+    }
+}
+
+pub(crate) fn remote_session_count(
+    config: &UserConfig,
+    id: &str,
+    request: crate::cli::SessionsRequest,
+    query: Option<String>,
+) -> Result<crate::cli::SessionCount> {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::SessionCount { request, query },
+        "session count",
+    )? {
+        RpcPayload::SessionCount { count } => Ok(count),
+        _ => bail!("machine '{id}' returned an unexpected session count metadata response"),
+    }
+}
+
+fn metadata_rpc(
+    config: &UserConfig,
+    id: &str,
+    operation: RpcOperation,
+    name: &str,
+) -> Result<RpcPayload> {
+    let machine = config
+        .machines
+        .iter()
+        .find(|machine| machine.id == id)
+        .ok_or_else(|| anyhow!("unknown machine '{id}'"))?;
+    let response = rpc(
+        machine,
+        operation,
+        Duration::from_secs(config.multi_machine.timeout_seconds()),
+    );
+    let response = match response {
+        Ok(RpcPayload::Error { message }) => Err(anyhow!(message)),
+        value => value,
+    };
+    response.map_err(|error| {
+        let message = error.to_string();
+        if message.contains("unknown variant") || message.contains("unsupported RPC protocol") {
+            anyhow!("machine '{id}' does not support {name} metadata; update Memex on that peer to use this view. {message}")
+        } else { error }
+    })
+}
+
 pub fn remote_shell_command(machine: &MachineConfig, command: &str) -> Result<String> {
     validate_machine(machine)?;
     let target = machine
@@ -1831,6 +1935,25 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
 
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
     match request {
+        RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
+            projects: crate::cli::collect_projects(paths, source)?,
+        }),
+        RpcOperation::Sessions { request } => Ok(RpcPayload::Sessions {
+            sessions: crate::cli::collect_sessions(
+                request.session_id,
+                request.source_path,
+                request.cwd.map(std::path::PathBuf::from),
+                request.project,
+                crate::cli::parse_source_filter(request.source)?,
+                request.since,
+                request.limit,
+                request.origin,
+                Some(paths.root.clone()),
+            )?,
+        }),
+        RpcOperation::SessionCount { request, query } => Ok(RpcPayload::SessionCount {
+            count: crate::cli::collect_session_count(paths, request, query)?,
+        }),
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }),
@@ -3411,6 +3534,167 @@ mod tests {
                 "codex".to_string(),
                 "sub-ses".to_string()
             )]))
+        );
+    }
+
+    #[test]
+    fn sessions_rpc_preserves_exact_identity_and_canonical_resume_command() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(
+            paths.root.join("config.toml"),
+            "codex_resume_cmd = 'configured-resume {session_id} {source_path_shell}'\n",
+        )
+        .unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for (id, path, ts, source) in [
+            ("shared", "/old session.jsonl", 1, SourceKind::Codex),
+            ("shared", "/new.jsonl", 2, SourceKind::Codex),
+            ("other", "/old session.jsonl", 3, SourceKind::Codex),
+            ("shared", "/old session.jsonl", 4, SourceKind::Claude),
+        ] {
+            let mut record = test_record(ts, id, path, 1);
+            record.source = source;
+            record.ts = ts;
+            analytics.record(&record).unwrap();
+        }
+        analytics.flush().unwrap();
+        for (path, count) in [("/old session.jsonl", 1), ("/absent.jsonl", 0)] {
+            let request: crate::cli::SessionsRequest = serde_json::from_value(serde_json::json!({
+                "source": "codex", "session_id": "shared", "source_path": path,
+                "origin": "all", "limit": 1,
+            }))
+            .unwrap();
+            let encoded = serde_json::to_vec(&RpcOperation::Sessions {
+                request: request.clone(),
+            })
+            .unwrap();
+            let decoded: RpcOperation = serde_json::from_slice(&encoded).unwrap();
+            let RpcPayload::Sessions { sessions } = handle_rpc(&paths, &config, decoded).unwrap()
+            else {
+                panic!("expected sessions metadata");
+            };
+            assert_eq!(sessions.len(), count);
+            let mcp = crate::cli::mcp_sessions(Some(paths.root.clone()), request).unwrap();
+            assert_eq!(mcp["results"].as_array().unwrap().len(), count);
+            if count == 1 {
+                assert_eq!(sessions[0]["source"], "codex");
+                assert_eq!(sessions[0]["session_id"], "shared");
+                assert_eq!(sessions[0]["source_path"], path);
+                assert_eq!(
+                    sessions[0]["resume_cmd"],
+                    "configured-resume shared '/old session.jsonl'"
+                );
+                assert_eq!(mcp["results"][0]["resume_cmd"], sessions[0]["resume_cmd"]);
+            }
+        }
+    }
+
+    #[test]
+    fn session_count_rpc_counts_exact_identities_with_filters_and_missing_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let config = UserConfig::load(&paths).unwrap();
+        let mut records = Vec::new();
+        for (doc, source, path, kind, project) in [
+            (1, SourceKind::Codex, "a.jsonl", None, "memex"),
+            (2, SourceKind::Codex, "b.jsonl", Some("subagent"), "memex"),
+            (3, SourceKind::Claude, "a.jsonl", None, "memex"),
+            (
+                4,
+                SourceKind::Codex,
+                "review.jsonl",
+                Some("guardian_review"),
+                "memex",
+            ),
+            (5, SourceKind::Codex, "other.jsonl", None, "other"),
+        ] {
+            let mut record = test_record(doc, "shared", path, 1);
+            record.source = source;
+            record.project = project.into();
+            record.text = "needle".into();
+            record.ts = 1_700_000_000_000 + doc * 1000;
+            record.links.conversation_kind = kind.map(str::to_string);
+            records.push(record);
+        }
+        let mut duplicate = records[0].clone();
+        duplicate.doc_id = 6;
+        records.push(duplicate);
+        let mut analytics = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        for record in &records {
+            analytics.record(record).unwrap();
+        }
+        analytics.flush().unwrap();
+        // Listing groups by repository metadata; lexical search uses indexed project.
+        rusqlite::Connection::open(analytics_path(&paths.state))
+            .unwrap()
+            .execute("UPDATE sessions SET repo_project = project", [])
+            .unwrap();
+        write_test_index(&paths, &records);
+        let count = |filters: serde_json::Value, query: Option<&str>| {
+            let request = serde_json::from_value(filters).unwrap();
+            let encoded = serde_json::to_vec(&RpcOperation::SessionCount {
+                request,
+                query: query.map(str::to_string),
+            })
+            .unwrap();
+            let decoded = serde_json::from_slice(&encoded).unwrap();
+            let RpcPayload::SessionCount { count } = handle_rpc(&paths, &config, decoded).unwrap()
+            else {
+                panic!("expected count");
+            };
+            count.total
+        };
+        for query in [None, Some("needle")] {
+            for (origin, expected) in [
+                ("all", 5),
+                ("regular", 4),
+                ("interactive", 3),
+                ("subagent", 1),
+            ] {
+                assert_eq!(
+                    count(serde_json::json!({"origin": origin, "limit": 1}), query),
+                    Some(expected)
+                );
+            }
+            assert_eq!(
+                count(
+                    serde_json::json!({"source": "codex", "project": "memex"}),
+                    query
+                ),
+                Some(2)
+            );
+            assert_eq!(
+                count(
+                    serde_json::json!({"source": "claude", "session_id": "shared", "source_path": "a.jsonl"}),
+                    query
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                count(
+                    serde_json::json!({"since": "1700000003000", "origin": "all"}),
+                    query
+                ),
+                Some(3)
+            );
+            assert_eq!(
+                count(serde_json::json!({"source_path": "missing"}), query),
+                Some(0)
+            );
+        }
+        assert_eq!(count(serde_json::json!({}), Some("absent")), Some(0));
+        let mut missing = test_record(7, "uncached", "uncached.jsonl", 1);
+        missing.text = "needle".into();
+        records.push(missing);
+        write_test_index(&paths, &records);
+        assert_eq!(count(serde_json::json!({}), Some("needle")), None);
+        assert_eq!(
+            count(serde_json::json!({"origin": "all"}), Some("needle")),
+            Some(6)
         );
     }
 
