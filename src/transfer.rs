@@ -1546,8 +1546,31 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Muse => {
             crate::sources::muse::cwd_from_muse_session(Path::new(&first.source_path))
         }
+        SourceKind::Antigravity => antigravity_cwd(Path::new(&first.source_path)),
     }
     .filter(|path| path.is_dir())
+}
+
+/// Best-effort cwd for an antigravity session: derive it from the message's
+/// `file://` project root stored in the store.
+fn antigravity_cwd(path: &Path) -> Option<PathBuf> {
+    use rusqlite::Connection;
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx LIMIT 8")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .ok()?;
+    for row in rows.flatten().flatten() {
+        let Some(url) = crate::sources::antigravity::project_root_from_payload(&row) else {
+            continue;
+        };
+        let root = url.trim_start_matches("file://");
+        return Some(PathBuf::from(root));
+    }
+    None
 }
 
 fn cwd_from_jsonl(path: &Path) -> Option<PathBuf> {

@@ -518,7 +518,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 12] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 13] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -531,6 +531,7 @@ fn assemble_usage_events(
         (SourceFilter::Hermes, scan_hermes),
         (SourceFilter::Jcode, scan_jcode),
         (SourceFilter::Muse, scan_muse),
+        (SourceFilter::Antigravity, scan_antigravity),
     ];
     for (filter, scanner) in SCANNERS {
         if source.is_none_or(|selected| selected == filter) {
@@ -1484,6 +1485,27 @@ fn scan_muse(
         warnings,
         out,
         |path| crate::sources::muse::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
+fn scan_antigravity(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::antigravity::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "antigravity",
+            parser_version: crate::sources::antigravity::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::antigravity::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }

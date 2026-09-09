@@ -45,6 +45,7 @@ pub struct IngestOptions {
     pub include_grok: bool,
     pub include_jcode: bool,
     pub include_muse: bool,
+    pub include_antigravity: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -254,6 +255,10 @@ fn prepare_file_task(
         // atomically instead: delete_first purges the stale rows first, so
         // growing files can neither duplicate records nor inflate counts.
         Some(_) if source == SourceKind::Jcode => (0, 0, true, HashMap::new(), false),
+        // An antigravity .db/overview.txt file is rewritten wholesale as the
+        // conversation grows (SQLite stores the WAL separately); a byte offset
+        // cannot resume mid-file, so reparse atomically instead.
+        Some(_) if source == SourceKind::Antigravity => (0, 0, true, HashMap::new(), false),
         Some(previous) => (
             previous.offset,
             previous.turn_id,
@@ -1418,6 +1423,36 @@ fn ingest_selected(
         }
     }
 
+    if options.include_antigravity && full_scan {
+        let antigravity_files = crate::sources::antigravity::discover();
+        for source_file in antigravity_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Antigravity,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
@@ -1721,6 +1756,14 @@ fn ingest_selected(
                     &progress,
                 ),
                 SourceKind::Muse => parse_muse_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Antigravity => parse_antigravity_file(
                     task,
                     options.include_reasoning,
                     &tx_record,
@@ -2430,6 +2473,39 @@ fn parse_muse_file(
     )
 }
 
+fn parse_antigravity_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::antigravity::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Antigravity, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Antigravity,
+        source_path,
+        parsed,
+    )
+}
+
 fn parse_cursor_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2796,6 +2872,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -5147,6 +5224,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -5589,6 +5667,7 @@ mod tests {
             include_grok: false,
             include_jcode: false,
             include_muse: false,
+            include_antigravity: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
