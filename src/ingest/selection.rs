@@ -255,6 +255,19 @@ fn resolve(
             if excluder.is_excluded(&path) || excluder.is_excluded(hint) {
                 continue;
             }
+            let path = if matches!(root.shape, Shape::Antigravity) {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix("-wal"))
+                    .filter(|name| name.ends_with(".db"))
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path)
+            } else {
+                path
+            };
+            if excluder.is_excluded(&path) {
+                continue;
+            }
             if path == root.lexical {
                 return Ok(DirtySelection::Resync);
             }

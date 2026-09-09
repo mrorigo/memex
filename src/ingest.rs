@@ -156,6 +156,7 @@ fn file_identity(path: &Path, metadata: &std::fs::Metadata, prefix_bytes: usize)
     };
 
     FileIdentity {
+        sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
         #[cfg(not(unix))]
@@ -222,7 +223,10 @@ fn prepare_file_task(
         })
         .unwrap_or_else(|| size.min(FILE_IDENTITY_PREFIX_BYTES as u64))
         .min(size) as usize;
-    let identity = file_identity(&path, metadata, prefix_bytes);
+    let mut identity = file_identity(&path, metadata, prefix_bytes);
+    if source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path) {
+        identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
+    }
     let parser_version = crate::sources::index_state_version_for(source, include_reasoning);
     let parser_version_invalidated =
         previous.is_some_and(|previous| previous.parser_version != parser_version);
@@ -233,6 +237,7 @@ fn prepare_file_task(
                 || mtime < previous.mtime
                 || previous.parser_version != parser_version
                 || file_was_replaced(&previous.identity, &identity)
+                || previous.identity.sqlite_wal != identity.sqlite_wal
                 || (size == previous.size
                     && previous
                         .identity
@@ -3327,6 +3332,74 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_ingest_tracks_wal_updates_and_checkpoint_without_duplicates() {
+        let _guard = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("gemini");
+        let database = source.join("antigravity-ide/conversations/session.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let _env = EnvVarGuard::set_os(&[("ANTIGRAVITY_HOME", Some(source.as_os_str()))]);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);").unwrap();
+        // Protobuf user step: field 19 { field 2: text }.
+        let put = |text: &str| {
+            let mut payload = vec![0x9a, 0x01, (text.len() + 2) as u8, 0x12, text.len() as u8];
+            payload.extend_from_slice(text.as_bytes());
+            writer
+                .execute(
+                    "INSERT OR REPLACE INTO steps VALUES (0, 14, 3, ?1)",
+                    [payload],
+                )
+                .unwrap();
+        };
+        put("original");
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_antigravity = true;
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let lease = ingest_lease(&paths);
+        let full = || {
+            let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+            ingest_all(&paths, &index, &options, &lease).unwrap()
+        };
+        assert_eq!(full().records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["original"]);
+        assert_eq!(full().records_added, 0);
+        let before = database.metadata().unwrap();
+        put("updated");
+        assert_eq!(
+            database.metadata().unwrap().modified().unwrap(),
+            before.modified().unwrap()
+        );
+        assert_eq!(database.metadata().unwrap().len(), before.len());
+        assert!(
+            crate::watch::dirty_needs_ingest(&paths, &HashSet::from([database.clone()])).unwrap()
+        );
+        let wal = database.with_file_name("session.db-wal");
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        let result = ingest_dirty(&paths, &index, &options, &lease, &HashSet::from([wal])).unwrap();
+        assert!(!result.full_scan);
+        assert_eq!(result.report.records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["updated"]);
+        assert!(
+            !crate::watch::dirty_needs_ingest(&paths, &HashSet::from([database.clone()])).unwrap()
+        );
+        put("full scan update");
+        assert_eq!(full().records_added, 1);
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        full();
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        drop(writer);
+        full();
+        assert_eq!(indexed_texts(&paths), ["full scan update"]);
+        assert_eq!(full().records_added, 0);
+    }
+
+    #[test]
     fn targeted_ingest_codex_history_uses_known_rollouts_without_discovery() {
         let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
@@ -4946,6 +5019,7 @@ mod tests {
             prefix_sha256: Some("same".to_string()),
             prefix_bytes: 4,
             modified_ns: Some(3),
+            sqlite_wal: None,
         };
         let current = FileIdentity {
             device: Some(4),
@@ -4963,6 +5037,7 @@ mod tests {
             prefix_sha256: Some("original".to_string()),
             prefix_bytes: 8,
             modified_ns: Some(3),
+            sqlite_wal: None,
         };
         let different_inode = FileIdentity {
             device: Some(4),

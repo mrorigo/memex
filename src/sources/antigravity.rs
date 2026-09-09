@@ -33,10 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    // Rebuild analytics metadata after adding session cwd extraction.
-    identity: 2,
+    // Rebuild analytics metadata with decoded project directory URLs.
+    identity: 3,
     // Bumped whenever record extraction logic changes; forces a full re-parse.
-    index: 1,
+    index: 2,
     usage: 1,
 };
 
@@ -69,7 +69,7 @@ pub fn sessions_root() -> PathBuf {
         .unwrap_or_else(|| super::common::home().join(".gemini"))
 }
 
-fn is_db_path(path: &Path) -> bool {
+pub(crate) fn is_db_path(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("db")
         && !is_wal_or_shm(path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
 }
@@ -335,7 +335,7 @@ fn index_db_file(
                         .unwrap_or_else(|| SourceKind::Antigravity.label().to_string()),
                     session_id: session_id.clone(),
                     turn_id,
-                    role: "assistant".to_string(),
+                    role: "tool_use".to_string(),
                     text,
                     tool_name: Some(tool_name),
                     tool_input: Some(args),
@@ -446,7 +446,7 @@ fn index_overview_file(
                     project: SourceKind::Antigravity.label().to_string(),
                     session_id: session_id.clone(),
                     turn_id,
-                    role: "assistant".to_string(),
+                    role: "tool_use".to_string(),
                     text: tool_input.clone(),
                     tool_name: Some(kind.to_lowercase()),
                     tool_input: Some(tool_input),
@@ -527,18 +527,20 @@ pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
         let Some(url) = project_root_from_payload(&payload) else {
             continue;
         };
-        let root = url.strip_prefix("file://")?;
-        return Some(PathBuf::from(root));
+        if let Some(root) = file_url_path(&url) {
+            return Some(root);
+        }
     }
     None
 }
 
-/// Strip a `file://` URL down to the leaf directory of the referenced path.
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    url::Url::parse(url).ok()?.to_file_path().ok()
+}
+
+/// Decode a `file://` URL and return the referenced path's leaf directory.
 fn parse_file_url_leaf(url: &str) -> Option<String> {
-    let path = url.strip_prefix("file://")?;
-    let path = path.trim_end_matches(['\n', '\r', ' ', ']']);
-    let path = path.split('?').next().unwrap_or(path);
-    Path::new(path)
+    file_url_path(url)?
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_string)
@@ -885,7 +887,7 @@ mod tests {
         assert_eq!(user.project, "antigravity");
         assert_eq!(records[1].role, "assistant");
         assert_eq!(records[1].text, "response text");
-        assert_eq!(records[2].role, "assistant");
+        assert_eq!(records[2].role, "tool_use");
         assert_eq!(records[2].tool_name.as_deref(), Some("bash"));
         assert!(
             records[2]
@@ -916,6 +918,80 @@ mod tests {
         msg.extend(field_bytes(5, &field_bytes(1, &timestamp_msg(1, 0))));
         msg.extend(field_bytes(19, &inner4));
         assert_eq!(project_from_user_payload(&msg).as_deref(), Some("repo-api"));
+    }
+
+    #[test]
+    fn all_tool_step_types_emit_tool_use_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM steps", []).unwrap();
+        for (idx, step_type) in TOOL_STEP_TYPES.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![idx as i64, *step_type as i64, tool_step()],
+            )
+            .unwrap();
+        }
+        let (records, _) = emit_collect(&db, false);
+        assert_eq!(records.len(), TOOL_STEP_TYPES.len());
+        for record in records {
+            assert_eq!(record.role, "tool_use");
+            assert_eq!(record.tool_name.as_deref(), Some("bash"));
+            assert_eq!(record.tool_input.as_deref(), Some(r#"{"command":"ls"}"#));
+        }
+    }
+
+    #[test]
+    fn project_and_cwd_decode_file_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        let conn = Connection::open(&db).unwrap();
+        let cwd = temp.path().join("My project #1 café%done");
+        fs::create_dir(&cwd).unwrap();
+        let url = url::Url::from_directory_path(&cwd).unwrap();
+        let mut user = field_bytes(2, b"hello");
+        user.extend(field_bytes(
+            4,
+            &field_bytes(2, &field_bytes(13, url.as_str().as_bytes())),
+        ));
+        let payload = field_bytes(19, &user);
+        conn.execute(
+            "UPDATE steps SET step_payload = ?1 WHERE idx = 0",
+            rusqlite::params![payload],
+        )
+        .unwrap();
+
+        assert_eq!(session_cwd(&db).as_deref(), Some(cwd.as_path()));
+        assert!(session_cwd(&db).unwrap().is_dir());
+        let (records, _) = emit_collect(&db, false);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.project == "My project #1 café%done")
+        );
+    }
+
+    #[test]
+    fn session_cwd_skips_invalid_project_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        let conn = Connection::open(&db).unwrap();
+        for (idx, url) in ["not a URL", "https://example.com/repo", "file:///tmp/repo"]
+            .iter()
+            .enumerate()
+        {
+            let payload = field_bytes(
+                19,
+                &field_bytes(4, &field_bytes(2, &field_bytes(13, url.as_bytes()))),
+            );
+            conn.execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
+                rusqlite::params![idx as i64 + 4, payload],
+            )
+            .unwrap();
+        }
+        assert_eq!(session_cwd(&db).as_deref(), Some(Path::new("/tmp/repo")));
     }
 
     #[test]
@@ -992,6 +1068,33 @@ mod tests {
         assert_eq!(records[1].text, "hi there");
         assert_eq!(records[0].ts, 1_779_194_148_000);
         assert!(output.session_id.is_some());
+    }
+
+    #[test]
+    fn overview_tool_kinds_emit_tool_use_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let overview = temp.path().join("overview.txt");
+        fs::write(
+            &overview,
+            r#"{"type":"RUN_COMMAND","content":"ls"}
+{"type":"VIEW_FILE","content":"README.md"}
+{"type":"CODE_ACTION","content":"edit README.md"}
+{"type":"RUN_COMMAND","tool_calls":[{"command":"pwd"}]}"#,
+        )
+        .unwrap();
+        let (records, _) = emit_collect(&overview, false);
+        assert_eq!(records.len(), 4);
+        for (record, (name, input)) in records.iter().zip([
+            ("run_command", "ls"),
+            ("view_file", "README.md"),
+            ("code_action", "edit README.md"),
+            ("run_command", r#"[{"command":"pwd"}]"#),
+        ]) {
+            assert_eq!(record.role, "tool_use");
+            assert_eq!(record.tool_name.as_deref(), Some(name));
+            assert_eq!(record.tool_input.as_deref(), Some(input));
+            assert_eq!(record.text, input);
+        }
     }
 
     #[test]
