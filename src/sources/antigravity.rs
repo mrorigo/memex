@@ -33,7 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
-    identity: 1,
+    // Rebuild analytics metadata after adding session cwd extraction.
+    identity: 2,
     // Bumped whenever record extraction logic changes; forces a full re-parse.
     index: 1,
     usage: 1,
@@ -506,6 +507,32 @@ pub(crate) fn project_root_from_payload(payload: &[u8]) -> Option<String> {
         })
 }
 
+/// Best-effort working directory for an Antigravity conversation store.
+///
+/// Antigravity records the active project root as a `file://` URL on user
+/// steps. This is used by analytics to resolve the enclosing Git repository.
+pub(crate) fn session_cwd(path: &Path) -> Option<PathBuf> {
+    if !is_db_path(path) {
+        return None;
+    }
+    let conn =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT step_payload FROM steps WHERE step_type = 14 ORDER BY idx")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .ok()?;
+    for payload in rows.flatten().flatten() {
+        let Some(url) = project_root_from_payload(&payload) else {
+            continue;
+        };
+        let root = url.strip_prefix("file://")?;
+        return Some(PathBuf::from(root));
+    }
+    None
+}
+
 /// Strip a `file://` URL down to the leaf directory of the referenced path.
 fn parse_file_url_leaf(url: &str) -> Option<String> {
     let path = url.strip_prefix("file://")?;
@@ -889,6 +916,28 @@ mod tests {
         msg.extend(field_bytes(5, &field_bytes(1, &timestamp_msg(1, 0))));
         msg.extend(field_bytes(19, &inner4));
         assert_eq!(project_from_user_payload(&msg).as_deref(), Some("repo-api"));
+    }
+
+    #[test]
+    fn session_cwd_reads_project_root_from_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = write_store(temp.path());
+        let project_block = field_bytes(13, b"file:///Users/x/src/repo-api");
+        let inner2 = field_bytes(2, &project_block);
+        let inner4 = field_bytes(4, &inner2);
+        let payload = field_bytes(19, &inner4);
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, has_subtrajectory, step_payload) \
+             VALUES (4, 14, 3, false, ?1)",
+            rusqlite::params![payload],
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_cwd(&db).as_deref(),
+            Some(Path::new("/Users/x/src/repo-api"))
+        );
     }
 
     #[test]
